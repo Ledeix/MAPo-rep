@@ -1,0 +1,7 @@
+Scene: output/N3DV/sear_steak/
+Method: ours_80000
+
+Scene:  output/N3DV/sear_steak/ SSIM :    0.9552055
+Scene:  output/N3DV/sear_steak/ PSNR :   32.1226234
+Scene:  output/N3DV/sear_steak/ LPIPS_VGG:    0.1304380
+Scene:  output/N3DV/sear_steak/ LPIPS_ALEX:    0.0362348

@@ -1,0 +1,7 @@
+Scene: output/N3DV/flame_steak/
+Method: ours_80000
+
+Scene:  output/N3DV/flame_steak/ SSIM :    0.9569209
+Scene:  output/N3DV/flame_steak/ PSNR :   32.2540398
+Scene:  output/N3DV/flame_steak/ LPIPS_VGG:    0.1245238
+Scene:  output/N3DV/flame_steak/ LPIPS_ALEX:    0.0319422

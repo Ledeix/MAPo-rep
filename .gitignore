@@ -1,2 +1,6 @@
 __pycache__/
-output
+
+data/
+output/
+
+*.so

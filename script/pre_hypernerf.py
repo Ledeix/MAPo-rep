@@ -10,7 +10,7 @@ import argparse
 import sqlite3
 
 sys.path.append(".")
-from scripts.thirdparty.helper3dg import getcolmapsinglehyper
+from script.thirdparty.helper3dg import getcolmapsinglehyper
 
 
 def rotmat2qvec(R):
@@ -195,5 +195,3 @@ if __name__ == "__main__" :
 
     ## step 3 run colmap, if error, reinstall opencv-headless 
     getcolmapsinglehyper(videopath)
-
-

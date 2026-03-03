@@ -1,0 +1,7 @@
+Scene: output/N3DV/cook_spinach/
+Method: ours_80000
+
+Scene:  output/N3DV/cook_spinach/ SSIM :    0.9479900
+Scene:  output/N3DV/cook_spinach/ PSNR :   32.1683884
+Scene:  output/N3DV/cook_spinach/ LPIPS_VGG:    0.1427691
+Scene:  output/N3DV/cook_spinach/ LPIPS_ALEX:    0.0432362

@@ -1,0 +1,7 @@
+Scene: output/N3DV/cut_roasted_beef/
+Method: ours_80000
+
+Scene:  output/N3DV/cut_roasted_beef/ SSIM :    0.9484151
+Scene:  output/N3DV/cut_roasted_beef/ PSNR :   32.5006714
+Scene:  output/N3DV/cut_roasted_beef/ LPIPS_VGG:    0.1409872
+Scene:  output/N3DV/cut_roasted_beef/ LPIPS_ALEX:    0.0429238
