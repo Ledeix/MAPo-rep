@@ -161,6 +161,24 @@ class OptimizationParams(ParamGroup):
         self.dynamic_score_stats_filename = "dynamic_score_stats.json"
         self.dynamic_score_include_values = True
         self.dynamic_score_hist_bins = 20
+
+        self.enable_temporal_partition = True
+        self.temporal_tau_interval = 500
+        self.temporal_split_interval = 1000
+        self.temporal_min_candidates = 1000
+        self.temporal_min_split_count = 100
+        self.temporal_max_level = 4
+        self.temporal_max_segments = 32
+        self.temporal_one_split_per_interval = True
+        self.temporal_q_level0 = 0.90
+        self.temporal_q_level1 = 0.95
+        self.temporal_q_level2 = 0.98
+        self.temporal_q_level3 = 0.99
+
+        self.temporal_debug_enable = True
+        self.temporal_debug_interval = 200
+        self.temporal_debug_render_interval = 1000
+        self.temporal_debug_render = False
         
         super().__init__(parser, "Optimization Parameters")
 

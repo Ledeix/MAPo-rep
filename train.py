@@ -30,6 +30,7 @@ from utils.extra_utils import o3d_knn, weighted_l2_loss_v2, image_sampler, calcu
 # import lpips
 from utils.scene_utils import render_training_image
 from time import time
+import torchvision
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 
@@ -42,6 +43,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    gaussians.configure_temporal_partition(opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -254,6 +256,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if opt.dynamic_score_topk > 0:
                     topk_path = os.path.join(args.model_path, f"dynamic_score_topk_{iteration:06d}.json")
                     gaussians.export_topk_dynamic_scores(topk_path, topk=opt.dynamic_score_topk, min_obs=opt.dynamic_score_min_obs)
+
+            if opt.enable_temporal_partition and iteration % opt.temporal_tau_interval == 0:
+                gaussians.segment_manager.update_taus(gaussians)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -293,6 +298,68 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     if opt.reset_opacity_ratio > 0 and iteration % opt.pruning_interval == 0:
                         gaussians.reset_opacity(opt.reset_opacity_ratio)
 
+            if opt.enable_temporal_partition and iteration % opt.temporal_split_interval == 0:
+                split_events = gaussians.segment_manager.maybe_split(gaussians, current_iter=iteration)
+                if len(split_events) > 0:
+                    for ev in split_events:
+                        print(
+                            f"[ITER {iteration}] split seg={ev['parent_seg_id']} -> ({ev['left_seg_id']},{ev['right_seg_id']}) "
+                            f"range=[{ev['range'][0]:.3f},{ev['range'][1]:.3f}) selected={ev['num_selected']} "
+                            f"N:{ev['old_num_gaussians']}->{ev['new_num_gaussians']}"
+                        )
+
+            if opt.enable_temporal_partition and opt.temporal_debug_enable and iteration % opt.temporal_debug_interval == 0:
+                gaussians.segment_manager.debug_dump(
+                    gaussians,
+                    args.model_path,
+                    iteration,
+                    settings_dict={
+                        "min_obs": opt.dynamic_score_min_obs,
+                        "max_level": opt.temporal_max_level,
+                        "max_segments_total": opt.temporal_max_segments,
+                        "quantiles_by_level": {
+                            "0": opt.temporal_q_level0,
+                            "1": opt.temporal_q_level1,
+                            "2": opt.temporal_q_level2,
+                            "3": opt.temporal_q_level3,
+                        },
+                    },
+                )
+
+            if opt.enable_temporal_partition and opt.temporal_debug_render and opt.temporal_debug_enable and iteration % opt.temporal_debug_render_interval == 0:
+                if len(viewpoint_cams) > 0:
+                    debug_cam = viewpoint_cams[0]
+                    if type(debug_cam.original_image) == type(None):
+                        debug_cam.load_image()
+
+                    debug_dir = os.path.join(args.model_path, "debug")
+                    os.makedirs(debug_dir, exist_ok=True)
+
+                    seg_ids = gaussians._seg_id_g.to(torch.int64)
+                    h1 = (seg_ids * 73856093) % 255
+                    h2 = (seg_ids * 19349663 + 47) % 255
+                    h3 = (seg_ids * 83492791 + 101) % 255
+                    seg_colors = torch.stack([h1, h2, h3], dim=-1).float().to(gaussians.get_xyz.device) / 255.0
+                    seg_img = render(debug_cam, gaussians, pipe, background, iter=iteration, override_color=seg_colors)["render"]
+                    torchvision.utils.save_image(seg_img, os.path.join(debug_dir, f"seg_color_iter{iteration:06d}.png"))
+
+                    time_val = float(debug_cam.time)
+                    active_mask = (time_val >= gaussians._t_start_g) & (time_val < gaussians._t_end_g)
+                    active_colors = torch.zeros((gaussians.get_xyz.shape[0], 3), device=gaussians.get_xyz.device)
+                    active_colors[active_mask] = 1.0
+                    act_img = render(debug_cam, gaussians, pipe, background, iter=iteration, override_color=active_colors)["render"]
+                    torchvision.utils.save_image(act_img, os.path.join(debug_dir, f"active_mask_iter{iteration:06d}.png"))
+
+                    tau_by_level = gaussians.segment_manager.tau_by_level
+                    dyn_mask = torch.zeros((gaussians.get_xyz.shape[0],), device=gaussians.get_xyz.device, dtype=torch.bool)
+                    for lv, tau in tau_by_level.items():
+                        lv_mask = gaussians._level_g == int(lv)
+                        dyn_mask = dyn_mask | (lv_mask & (gaussians._dyn_score > float(tau)))
+                    dyn_colors = torch.full((gaussians.get_xyz.shape[0], 3), 0.5, device=gaussians.get_xyz.device)
+                    dyn_colors[dyn_mask] = torch.tensor([1.0, 0.0, 0.0], device=gaussians.get_xyz.device)
+                    dyn_img = render(debug_cam, gaussians, pipe, background, iter=iteration, override_color=dyn_colors)["render"]
+                    torchvision.utils.save_image(dyn_img, os.path.join(debug_dir, f"dynamic_mask_iter{iteration:06d}.png"))
+
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
@@ -306,6 +373,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname):
     tb_writer = prepare_output_and_logger(expname)
     gaussians = GaussianModel(dataset.sh_degree, hyper)
+    gaussians.configure_temporal_partition(opt)
     dataset.model_path = args.model_path
     timer = Timer()
     scene = Scene(dataset, gaussians, shuffle=dataset.shuffle, loader=dataset.loader, duration=hyper.total_num_frames, opt=opt)

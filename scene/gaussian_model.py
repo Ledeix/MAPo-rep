@@ -23,6 +23,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.deformation import deform_network
+from scene.segment_manager import SegmentManager
 
 
 class GaussianModel:
@@ -46,6 +47,7 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int, args):
+        self.args = args
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
 
@@ -63,9 +65,18 @@ class GaussianModel:
         self._dyn_score = torch.empty(0)
         self._dyn_obs = torch.empty(0, dtype=torch.long)
         self._birth_iter = torch.empty(0, dtype=torch.long)
+        self._seg_id_g = torch.empty(0, dtype=torch.int32)
+        self._t_start_g = torch.empty(0)
+        self._t_end_g = torch.empty(0)
+        self._level_g = torch.empty(0, dtype=torch.int32)
         self._dyn_history = None
         self._dyn_history_ptr = 0
         self._dyn_history_count = 0
+
+        self.total_time = float(args.total_num_frames)
+        self.segment_manager = SegmentManager(args, self._deformation, total_time=self.total_time)
+        self._registered_segment_ids = set([0])
+        self._training_args = None
 
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -94,10 +105,18 @@ class GaussianModel:
             self._dyn_score,
             self._dyn_obs,
             self._birth_iter,
+            self._seg_id_g,
+            self._t_start_g,
+            self._t_end_g,
+            self._level_g,
+            self.segment_manager.state_dict(),
+            self.segment_manager.records,
+            self.segment_manager.next_seg_id,
+            self.segment_manager.tau_by_level,
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) >= 17:
+        if len(model_args) >= 24:
             (self.active_sh_degree,
             self._xyz,
             self._deformation,
@@ -114,7 +133,19 @@ class GaussianModel:
             self.spatial_lr_scale,
             self._dyn_score,
             self._dyn_obs,
-            self._birth_iter) = model_args
+            self._birth_iter,
+            self._seg_id_g,
+            self._t_start_g,
+            self._t_end_g,
+            self._level_g,
+            segment_manager_state,
+            segment_records,
+            segment_next_seg_id,
+            segment_tau_by_level) = model_args
+            self.segment_manager.load_state_dict(segment_manager_state)
+            self.segment_manager.records = segment_records
+            self.segment_manager.next_seg_id = segment_next_seg_id
+            self.segment_manager.tau_by_level = segment_tau_by_level
         else:
             (self.active_sh_degree,
             self._xyz,
@@ -131,6 +162,7 @@ class GaussianModel:
             opt_dict,
             self.spatial_lr_scale) = model_args
             self._initialize_dynamic_states(self._xyz.shape[0], current_iter=0, device=self._xyz.device)
+            self._initialize_segment_states(self._xyz.shape[0], device=self._xyz.device)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -138,6 +170,11 @@ class GaussianModel:
         self._dyn_score = self._dyn_score.to(self._xyz.device, dtype=torch.float32)
         self._dyn_obs = self._dyn_obs.to(self._xyz.device, dtype=torch.long)
         self._birth_iter = self._birth_iter.to(self._xyz.device, dtype=torch.long)
+        self._seg_id_g = self._seg_id_g.to(self._xyz.device, dtype=torch.int32)
+        self._t_start_g = self._t_start_g.to(self._xyz.device, dtype=torch.float32)
+        self._t_end_g = self._t_end_g.to(self._xyz.device, dtype=torch.float32)
+        self._level_g = self._level_g.to(self._xyz.device, dtype=torch.int32)
+        self.assert_metadata_alignment()
 
     @property
     def get_scaling(self):
@@ -181,6 +218,21 @@ class GaussianModel:
     @property
     def get_birth_iter(self):
         return self._birth_iter
+
+    def configure_temporal_partition(self, opt):
+        self.segment_manager.enabled = bool(getattr(opt, "enable_temporal_partition", False))
+        self.segment_manager.min_obs = int(getattr(opt, "dynamic_score_min_obs", self.segment_manager.min_obs))
+        self.segment_manager.min_candidates = int(getattr(opt, "temporal_min_candidates", self.segment_manager.min_candidates))
+        self.segment_manager.min_split_count = int(getattr(opt, "temporal_min_split_count", self.segment_manager.min_split_count))
+        self.segment_manager.max_level = int(getattr(opt, "temporal_max_level", self.segment_manager.max_level))
+        self.segment_manager.max_segments_total = int(getattr(opt, "temporal_max_segments", self.segment_manager.max_segments_total))
+        self.segment_manager.one_split_per_interval = bool(getattr(opt, "temporal_one_split_per_interval", self.segment_manager.one_split_per_interval))
+        self.segment_manager.quantiles_by_level = {
+            0: float(getattr(opt, "temporal_q_level0", self.segment_manager.quantiles_by_level.get(0, 0.90))),
+            1: float(getattr(opt, "temporal_q_level1", self.segment_manager.quantiles_by_level.get(1, 0.95))),
+            2: float(getattr(opt, "temporal_q_level2", self.segment_manager.quantiles_by_level.get(2, 0.98))),
+            3: float(getattr(opt, "temporal_q_level3", self.segment_manager.quantiles_by_level.get(3, 0.99))),
+        }
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -230,6 +282,106 @@ class GaussianModel:
         self._dyn_history = None
         self._dyn_history_ptr = 0
         self._dyn_history_count = 0
+
+    def _initialize_segment_states(self, num_points, device=None):
+        if device is None:
+            device = self._xyz.device if self._xyz.numel() > 0 else "cuda"
+        self._seg_id_g = torch.zeros((num_points,), device=device, dtype=torch.int32)
+        self._t_start_g = torch.zeros((num_points,), device=device, dtype=torch.float32)
+        self._t_end_g = torch.full((num_points,), float(self.total_time), device=device, dtype=torch.float32)
+        self._level_g = torch.zeros((num_points,), device=device, dtype=torch.int32)
+
+    def _append_segment_states(self, parent_indices=None, new_count=0):
+        if parent_indices is not None:
+            parent_indices = parent_indices.long().to(self._xyz.device)
+            new_count = int(parent_indices.shape[0])
+        else:
+            new_count = int(new_count)
+        if new_count <= 0:
+            return
+        if parent_indices is not None and self._seg_id_g.numel() > 0:
+            seg_id = self._seg_id_g[parent_indices]
+            t_start = self._t_start_g[parent_indices]
+            t_end = self._t_end_g[parent_indices]
+            level = self._level_g[parent_indices]
+        else:
+            seg_id = torch.zeros((new_count,), device=self._xyz.device, dtype=torch.int32)
+            t_start = torch.zeros((new_count,), device=self._xyz.device, dtype=torch.float32)
+            t_end = torch.full((new_count,), float(self.total_time), device=self._xyz.device, dtype=torch.float32)
+            level = torch.zeros((new_count,), device=self._xyz.device, dtype=torch.int32)
+        self._seg_id_g = torch.cat([self._seg_id_g, seg_id], dim=0)
+        self._t_start_g = torch.cat([self._t_start_g, t_start], dim=0)
+        self._t_end_g = torch.cat([self._t_end_g, t_end], dim=0)
+        self._level_g = torch.cat([self._level_g, level], dim=0)
+
+    def _prune_segment_states(self, valid_points_mask):
+        self._seg_id_g = self._seg_id_g[valid_points_mask]
+        self._t_start_g = self._t_start_g[valid_points_mask]
+        self._t_end_g = self._t_end_g[valid_points_mask]
+        self._level_g = self._level_g[valid_points_mask]
+
+    def assert_metadata_alignment(self):
+        n = self.get_xyz.shape[0]
+        assert self._dyn_score.shape[0] == n
+        assert self._dyn_obs.shape[0] == n
+        assert self._birth_iter.shape[0] == n
+        assert self._seg_id_g.shape[0] == n
+        assert self._t_start_g.shape[0] == n
+        assert self._t_end_g.shape[0] == n
+        assert self._level_g.shape[0] == n
+
+    def register_new_segment_optimizer_params(self, seg_ids):
+        if self.optimizer is None or self._training_args is None:
+            return
+        for seg_id in seg_ids:
+            if seg_id in self._registered_segment_ids:
+                continue
+            net = self.segment_manager.get_net(seg_id)
+            self.optimizer.add_param_group({
+                'params': list(net.get_mlp_parameters()),
+                'lr': self._training_args.deformation_lr_init * self.spatial_lr_scale,
+                'name': f'deformation_seg_{seg_id}',
+            })
+            self.optimizer.add_param_group({
+                'params': [net.offsets],
+                'lr': self._training_args.offsets_lr,
+                'name': f'offsets_seg_{seg_id}',
+            })
+            self._registered_segment_ids.add(seg_id)
+
+    def apply_segmented_deformation(self, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx,
+                                    num_down_emb_c=30, num_down_emb_f=30):
+        return self.segment_manager.forward_deformation(
+            self, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx,
+            num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f,
+        )
+
+    def append_gaussian_clones(self, parent_indices, current_iter=0):
+        parent_indices = parent_indices.long().to(self._xyz.device)
+        if parent_indices.numel() == 0:
+            return torch.empty(0, device=self._xyz.device, dtype=torch.long)
+
+        new_xyz = self._xyz[parent_indices]
+        new_features_dc = self._features_dc[parent_indices]
+        new_features_rest = self._features_rest[parent_indices]
+        new_opacities = self._opacity[parent_indices]
+        new_scaling = self._scaling[parent_indices]
+        new_rotation = self._rotation[parent_indices]
+        new_embedding = self._embedding[parent_indices]
+
+        old_n = self.get_xyz.shape[0]
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_embedding,
+            parent_indices=parent_indices,
+            current_iter=current_iter,
+        )
+        return torch.arange(old_n, self.get_xyz.shape[0], device=self._xyz.device, dtype=torch.long)
 
     @staticmethod
     def _percentile_normalize(values, low_percentile, high_percentile, eps=1e-6):
@@ -387,11 +539,15 @@ class GaussianModel:
         self._embedding = nn.Parameter(embedding.requires_grad_(True))  # [jm]
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._initialize_dynamic_states(self.get_xyz.shape[0], current_iter=0, device=self._xyz.device)
+        self._initialize_segment_states(self.get_xyz.shape[0], device=self._xyz.device)
+        self.assert_metadata_alignment()
 
     def training_setup(self, training_args):
+        self._training_args = training_args
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.segment_manager = self.segment_manager.to("cuda")
         
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -529,6 +685,8 @@ class GaussianModel:
         self._embedding = nn.Parameter(torch.tensor(embeddings, dtype=torch.float, device="cuda").requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
         self._initialize_dynamic_states(self.get_xyz.shape[0], current_iter=0, device=self._xyz.device)
+        self._initialize_segment_states(self.get_xyz.shape[0], device=self._xyz.device)
+        self.assert_metadata_alignment()
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -548,7 +706,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if len(group["params"]) > 1 or group["name"] == "offsets":
+            if len(group["params"]) > 1 or group["name"].startswith("offsets"):
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
@@ -580,11 +738,13 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self._prune_dynamic_states(valid_points_mask)
+        self._prune_segment_states(valid_points_mask)
+        self.assert_metadata_alignment()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if len(group["params"])>1 or group["name"] == "offsets":continue
+            if len(group["params"])>1 or group["name"].startswith("offsets"):continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -628,6 +788,8 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._append_dynamic_states(parent_indices=parent_indices, current_iter=current_iter)
+        self._append_segment_states(parent_indices=parent_indices)
+        self.assert_metadata_alignment()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, current_iter=0):
         n_init_points = self.get_xyz.shape[0]

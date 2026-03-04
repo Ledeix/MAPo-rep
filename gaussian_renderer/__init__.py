@@ -68,8 +68,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = pc._scaling
         rotations = pc._rotation
 
-    means3D_final, scales_final, rotations_final, opacity_final, shs_final, extras = pc._deformation(means3D, scales, 
-        rotations, opacity, time, cam_no, pc, None, shs, iter=iter, num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f)
+    (means3D_final, scales_final, rotations_final, opacity_final, shs_final, extras), active_mask = pc.apply_segmented_deformation(
+        means3D,
+        scales,
+        rotations,
+        opacity,
+        time,
+        cam_no,
+        shs,
+        iter,
+        num_down_emb_c=num_down_emb_c,
+        num_down_emb_f=num_down_emb_f,
+    )
 
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
@@ -118,5 +128,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii,
             "depth":depth,
             "deformed_xyz": means3D_final,
+            "active_mask": active_mask,
             "sh_coefs_final": shs_final,
             "extras":extras,}
