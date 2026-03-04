@@ -137,6 +137,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         cam_no_list, frame_no_list = [], []
+        if opt.enable_dynamic_score:
+            deformed_sum = torch.zeros_like(gaussians.get_xyz, device=gaussians.get_xyz.device, dtype=torch.float32)
+            deformed_count = torch.zeros((gaussians.get_xyz.shape[0],), device=gaussians.get_xyz.device, dtype=torch.float32)
         for viewpoint_cam in viewpoint_cams:
             if type(viewpoint_cam.original_image) == type(None):
                 viewpoint_cam.load_image()  # for lazy loading (to avoid OOM issue)
@@ -147,6 +150,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, cam_no=cam_no, iter=iteration, \
                 num_down_emb_c=hyper.min_embeddings, num_down_emb_f=hyper.min_embeddings)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+            if opt.enable_dynamic_score:
+                if "deformed_xyz" in render_pkg and render_pkg["deformed_xyz"] is not None:
+                    deformed_xyz = render_pkg["deformed_xyz"].detach()
+                    deformed_sum[visibility_filter] += deformed_xyz[visibility_filter]
+                    deformed_count[visibility_filter] += 1.0
 
             images.append(image.unsqueeze(0))
             gt_image = viewpoint_cam.original_image.cuda()
@@ -204,6 +213,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
             viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
+
+        if opt.enable_dynamic_score and (deformed_count > 0).any():
+            visible_mask = deformed_count > 0
+            deformed_avg = gaussians.get_xyz.detach().clone()
+            deformed_avg[visible_mask] = deformed_sum[visible_mask] / deformed_count[visible_mask, None]
+            gaussians.update_dynamic_score_harmonic(
+                deformed_avg,
+                visible_mask,
+                history_size=opt.dynamic_score_history_size,
+                percentile_low=opt.dynamic_score_percentile_low,
+                percentile_high=opt.dynamic_score_percentile_high,
+                eps=opt.dynamic_score_eps,
+            )
+
         iter_end.record()
 
         if iteration in saving_iterations:
@@ -225,6 +248,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                                           "psnr": f"{psnr_:.{2}f}",
                                           "point":f"{total_point}"})
                 progress_bar.update(10)
+            if opt.enable_dynamic_score and opt.dynamic_score_log_interval > 0 and iteration % opt.dynamic_score_log_interval == 0:
+                dyn_brief = gaussians.get_dynamic_score_brief(min_obs=opt.dynamic_score_min_obs)
+                print(f"[ITER {iteration}] dyn_score(mean={dyn_brief['mean']:.6f}, max={dyn_brief['max']:.6f}, mature={dyn_brief['mature_ratio']*100:.2f}% [{dyn_brief['num_mature']}/{dyn_brief['num_total']}])")
+                if opt.dynamic_score_topk > 0:
+                    topk_path = os.path.join(args.model_path, f"dynamic_score_topk_{iteration:06d}.json")
+                    gaussians.export_topk_dynamic_scores(topk_path, topk=opt.dynamic_score_topk, min_obs=opt.dynamic_score_min_obs)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -255,7 +284,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     
-                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
+                    gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold, current_iter=iteration)
                 if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
@@ -292,6 +321,16 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     hours, remainder = divmod(total_time_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     print(f"training time: {int(hours)}h {int(minutes)}m {seconds}sec")
+
+    if opt.enable_dynamic_score:
+        stats_path = os.path.join(dataset.model_path, opt.dynamic_score_stats_filename)
+        gaussians.export_dynamic_score_stats(
+            stats_path,
+            include_values=opt.dynamic_score_include_values,
+            hist_bins=opt.dynamic_score_hist_bins,
+            min_obs=opt.dynamic_score_min_obs,
+        )
+        print(f"dynamic score stats saved to: {stats_path}")
 
 
 def prepare_output_and_logger(expname):    

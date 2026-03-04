@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import json
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -59,6 +60,12 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._embedding = torch.empty(0)
+        self._dyn_score = torch.empty(0)
+        self._dyn_obs = torch.empty(0, dtype=torch.long)
+        self._birth_iter = torch.empty(0, dtype=torch.long)
+        self._dyn_history = None
+        self._dyn_history_ptr = 0
+        self._dyn_history_count = 0
 
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -84,27 +91,53 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._dyn_score,
+            self._dyn_obs,
+            self._birth_iter,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._deformation,
-        self._features_dc, 
-        self._features_rest,
-        self._embedding,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) >= 17:
+            (self.active_sh_degree,
+            self._xyz,
+            self._deformation,
+            self._features_dc,
+            self._features_rest,
+            self._embedding,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self._dyn_score,
+            self._dyn_obs,
+            self._birth_iter) = model_args
+        else:
+            (self.active_sh_degree,
+            self._xyz,
+            self._deformation,
+            self._features_dc,
+            self._features_rest,
+            self._embedding,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            self._initialize_dynamic_states(self._xyz.shape[0], current_iter=0, device=self._xyz.device)
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self._dyn_score = self._dyn_score.to(self._xyz.device, dtype=torch.float32)
+        self._dyn_obs = self._dyn_obs.to(self._xyz.device, dtype=torch.long)
+        self._birth_iter = self._birth_iter.to(self._xyz.device, dtype=torch.long)
 
     @property
     def get_scaling(self):
@@ -136,6 +169,18 @@ class GaussianModel:
     @property
     def get_embedding(self):
         return self._embedding
+
+    @property
+    def get_dynamic_score(self):
+        return self._dyn_score
+
+    @property
+    def get_dynamic_obs(self):
+        return self._dyn_obs
+
+    @property
+    def get_birth_iter(self):
+        return self._birth_iter
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -143,6 +188,174 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    def _initialize_dynamic_states(self, num_points, current_iter=0, device=None):
+        if device is None:
+            device = self._xyz.device if self._xyz.numel() > 0 else "cuda"
+        self._dyn_score = torch.zeros((num_points,), device=device, dtype=torch.float32)
+        self._dyn_obs = torch.zeros((num_points,), device=device, dtype=torch.long)
+        self._birth_iter = torch.full((num_points,), int(current_iter), device=device, dtype=torch.long)
+        self._dyn_history = None
+        self._dyn_history_ptr = 0
+        self._dyn_history_count = 0
+
+    def _append_dynamic_states(self, parent_indices=None, new_count=0, current_iter=0):
+        if parent_indices is not None:
+            parent_indices = parent_indices.long().to(self._xyz.device)
+            new_count = int(parent_indices.shape[0])
+        else:
+            new_count = int(new_count)
+
+        if new_count <= 0:
+            return
+
+        if parent_indices is not None and self._dyn_score.numel() > 0:
+            new_score = self._dyn_score[parent_indices]
+        else:
+            new_score = torch.zeros((new_count,), device=self._xyz.device, dtype=torch.float32)
+        new_obs = torch.zeros((new_count,), device=self._xyz.device, dtype=torch.long)
+        new_birth = torch.full((new_count,), int(current_iter), device=self._xyz.device, dtype=torch.long)
+
+        self._dyn_score = torch.cat([self._dyn_score, new_score], dim=0)
+        self._dyn_obs = torch.cat([self._dyn_obs, new_obs], dim=0)
+        self._birth_iter = torch.cat([self._birth_iter, new_birth], dim=0)
+        self._dyn_history = None
+        self._dyn_history_ptr = 0
+        self._dyn_history_count = 0
+
+    def _prune_dynamic_states(self, valid_points_mask):
+        self._dyn_score = self._dyn_score[valid_points_mask]
+        self._dyn_obs = self._dyn_obs[valid_points_mask]
+        self._birth_iter = self._birth_iter[valid_points_mask]
+        self._dyn_history = None
+        self._dyn_history_ptr = 0
+        self._dyn_history_count = 0
+
+    @staticmethod
+    def _percentile_normalize(values, low_percentile, high_percentile, eps=1e-6):
+        low = float(np.clip(low_percentile, 0.0, 100.0)) / 100.0
+        high = float(np.clip(high_percentile, 0.0, 100.0)) / 100.0
+        if high < low:
+            low, high = high, low
+
+        q_low = torch.quantile(values, low)
+        q_high = torch.quantile(values, high)
+        denom = torch.clamp(q_high - q_low, min=eps)
+        return torch.clamp((values - q_low) / denom, min=0.0, max=1.0)
+
+    def _ensure_dyn_history(self, history_size):
+        num_points = self.get_xyz.shape[0]
+        if history_size <= 0 or num_points == 0:
+            return
+        target_shape = (history_size, num_points, 3)
+        if self._dyn_history is None or self._dyn_history.shape != target_shape:
+            self._dyn_history = torch.zeros(target_shape, device=self._xyz.device, dtype=torch.float32)
+            self._dyn_history_ptr = 0
+            self._dyn_history_count = 0
+
+    @torch.no_grad()
+    def update_dynamic_score_harmonic(self, deformed_xyz, visibility_filter,
+                                      history_size=30, percentile_low=5.0, percentile_high=95.0, eps=1e-6):
+        if deformed_xyz is None or visibility_filter is None or self.get_xyz.shape[0] == 0 or history_size <= 0:
+            return
+
+        self._ensure_dyn_history(int(history_size))
+        if self._dyn_history is None:
+            return
+
+        visible_mask = visibility_filter.to(self._xyz.device).bool()
+        if not visible_mask.any():
+            return
+
+        current_xyz = deformed_xyz.detach().to(self._xyz.device, dtype=torch.float32)
+        if self._dyn_history_count == 0:
+            snapshot = current_xyz.clone()
+        else:
+            prev_idx = (self._dyn_history_ptr - 1) % int(history_size)
+            snapshot = self._dyn_history[prev_idx].clone()
+            snapshot[visible_mask] = current_xyz[visible_mask]
+
+        self._dyn_history[self._dyn_history_ptr] = snapshot
+        self._dyn_history_ptr = (self._dyn_history_ptr + 1) % int(history_size)
+        self._dyn_history_count = min(self._dyn_history_count + 1, int(history_size))
+        self._dyn_obs[visible_mask] += 1
+
+        if self._dyn_history_count < 2:
+            return
+
+        history = self._dyn_history[:self._dyn_history_count]
+        pos_max = history.max(dim=0).values
+        pos_min = history.min(dim=0).values
+        displacement = torch.linalg.norm(pos_max - pos_min, dim=-1)
+
+        pos_mean = history.mean(dim=0, keepdim=True)
+        variance = ((history - pos_mean) ** 2).sum(dim=-1).mean(dim=0)
+
+        displacement_norm = self._percentile_normalize(displacement, percentile_low, percentile_high, eps)
+        variance_norm = self._percentile_normalize(variance, percentile_low, percentile_high, eps)
+        inv_disp = 1.0 / (displacement_norm + eps)
+        inv_var = 1.0 / (variance_norm + eps)
+        self._dyn_score = 2.0 / (inv_disp + inv_var)
+
+    @torch.no_grad()
+    def update_dynamic_score_ema(self, motion_signal, visibility_filter, beta=0.02):
+        if self._dyn_score.numel() == 0 or motion_signal is None or visibility_filter is None:
+            return
+
+        beta = float(np.clip(beta, 0.0, 1.0))
+        visible_mask = visibility_filter.to(self._xyz.device).bool()
+        if not visible_mask.any():
+            return
+
+        motion_signal = motion_signal.to(self._xyz.device, dtype=torch.float32)
+        self._dyn_score[visible_mask] = (1.0 - beta) * self._dyn_score[visible_mask] + beta * motion_signal[visible_mask]
+        self._dyn_obs[visible_mask] += 1
+
+    def get_mature_mask(self, min_obs=50):
+        return self._dyn_obs >= int(min_obs)
+
+    @torch.no_grad()
+    def get_dynamic_score_brief(self, min_obs=50):
+        if self._dyn_score.numel() == 0:
+            return {"mean": 0.0, "max": 0.0, "mature_ratio": 0.0, "num_mature": 0, "num_total": 0}
+        mature_mask = self.get_mature_mask(min_obs)
+        num_total = int(self._dyn_score.shape[0])
+        num_mature = int(mature_mask.sum().item())
+        mature_ratio = float(num_mature / max(num_total, 1))
+        if num_mature == 0:
+            return {"mean": 0.0, "max": 0.0, "mature_ratio": mature_ratio, "num_mature": 0, "num_total": num_total}
+        mature_scores = self._dyn_score[mature_mask]
+        return {
+            "mean": float(mature_scores.mean().item()),
+            "max": float(mature_scores.max().item()),
+            "mature_ratio": mature_ratio,
+            "num_mature": num_mature,
+            "num_total": num_total,
+        }
+
+    @torch.no_grad()
+    def export_topk_dynamic_scores(self, json_path, topk=0, min_obs=50):
+        topk = int(topk)
+        if topk <= 0 or self._dyn_score.numel() == 0:
+            return None
+        mature_mask = self.get_mature_mask(min_obs)
+        mature_idx = torch.where(mature_mask)[0]
+        if mature_idx.numel() == 0:
+            return None
+        mature_scores = self._dyn_score[mature_mask]
+        k = min(topk, mature_scores.numel())
+        values, indices = torch.topk(mature_scores, k=k, largest=True)
+        selected_idx = mature_idx[indices]
+        payload = {
+            "topk": k,
+            "indices": selected_idx.detach().cpu().tolist(),
+            "scores": values.detach().cpu().tolist(),
+            "obs": self._dyn_obs[selected_idx].detach().cpu().tolist(),
+            "birth_iter": self._birth_iter[selected_idx].detach().cpu().tolist(),
+        }
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+        return payload
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, time_line: int):
         self.spatial_lr_scale = spatial_lr_scale
@@ -173,6 +386,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._embedding = nn.Parameter(embedding.requires_grad_(True))  # [jm]
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._initialize_dynamic_states(self.get_xyz.shape[0], current_iter=0, device=self._xyz.device)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -314,6 +528,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._embedding = nn.Parameter(torch.tensor(embeddings, dtype=torch.float, device="cuda").requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
+        self._initialize_dynamic_states(self.get_xyz.shape[0], current_iter=0, device=self._xyz.device)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -364,6 +579,7 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self._prune_dynamic_states(valid_points_mask)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -388,7 +604,8 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding,
+                              parent_indices=None, current_iter=0):
         d = {"xyz": new_xyz, 
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -410,8 +627,9 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._append_dynamic_states(parent_indices=parent_indices, current_iter=current_iter)
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, current_iter=0):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -432,12 +650,15 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_embedding = self._embedding[selected_pts_mask].repeat(N,1)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_embedding)
+        selected_indices = torch.where(selected_pts_mask)[0]
+        parent_indices = selected_indices.repeat(N)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_embedding,
+                       parent_indices=parent_indices, current_iter=current_iter)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, current_iter=0):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -450,7 +671,9 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_embedding = self._embedding[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding)
+        parent_indices = torch.where(selected_pts_mask)[0]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_embedding,
+                       parent_indices=parent_indices, current_iter=current_iter)
 
     def prune(self, max_grad, min_opacity, extent, max_screen_size, use_mean=False):
         if use_mean:
@@ -466,12 +689,12 @@ class GaussianModel:
         self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
-    def densify(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify(self, max_grad, min_opacity, extent, max_screen_size, current_iter=0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, current_iter=current_iter)
+        self.densify_and_split(grads, max_grad, extent, current_iter=current_iter)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor[update_filter,:2], dim=-1, keepdim=True)
@@ -488,3 +711,62 @@ class GaussianModel:
                     if weight.grad.mean() != 0:
                         print(name," :",weight.grad.mean(), weight.grad.min(), weight.grad.max())
         print("-"*50)
+
+    @torch.no_grad()
+    def export_dynamic_score_stats(self, json_path, include_values=True, hist_bins=20, min_obs=50):
+        if self._dyn_score.numel() == 0:
+            return None
+
+        mature_mask = self.get_mature_mask(min_obs)
+        scores = self._dyn_score[mature_mask].detach().float().cpu()
+        num_total = int(self._dyn_score.shape[0])
+        num_mature = int(mature_mask.sum().item())
+        if num_mature == 0:
+            payload = {
+                "num_gaussians": num_total,
+                "num_mature": 0,
+                "mature_ratio": 0.0,
+                "min_obs": int(min_obs),
+                "message": "No mature gaussians yet",
+            }
+            with open(json_path, "w", encoding="utf-8") as file:
+                json.dump(payload, file, indent=2)
+            return payload
+
+        scores_np = scores.numpy()
+        hist_bins = max(int(hist_bins), 1)
+        hist_counts, hist_edges = np.histogram(scores_np, bins=hist_bins, range=(0.0, 1.0))
+
+        payload = {
+            "num_gaussians": num_total,
+            "num_mature": num_mature,
+            "mature_ratio": float(num_mature / max(num_total, 1)),
+            "min_obs": int(min_obs),
+            "min": float(scores_np.min()),
+            "max": float(scores_np.max()),
+            "mean": float(scores_np.mean()),
+            "std": float(scores_np.std()),
+            "p01": float(np.percentile(scores_np, 1)),
+            "p05": float(np.percentile(scores_np, 5)),
+            "p10": float(np.percentile(scores_np, 10)),
+            "p25": float(np.percentile(scores_np, 25)),
+            "p50": float(np.percentile(scores_np, 50)),
+            "p75": float(np.percentile(scores_np, 75)),
+            "p90": float(np.percentile(scores_np, 90)),
+            "p95": float(np.percentile(scores_np, 95)),
+            "p99": float(np.percentile(scores_np, 99)),
+            "histogram": {
+                "bins": hist_bins,
+                "range": [0.0, 1.0],
+                "counts": hist_counts.tolist(),
+                "edges": hist_edges.tolist(),
+            },
+        }
+
+        if include_values:
+            payload["scores"] = scores_np.tolist()
+
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+
+        return payload

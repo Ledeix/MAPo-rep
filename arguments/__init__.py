@@ -148,6 +148,19 @@ class OptimizationParams(ParamGroup):
         self.num_multiview_ssim = 0
         self.offsets_lr = 0.00002
         self.reg_coef = 1.0
+
+        self.enable_dynamic_score = True
+        self.dynamic_score_ema_beta = 0.02
+        self.dynamic_score_history_size = 30
+        self.dynamic_score_percentile_low = 5.0
+        self.dynamic_score_percentile_high = 95.0
+        self.dynamic_score_eps = 1e-6
+        self.dynamic_score_min_obs = 50
+        self.dynamic_score_log_interval = 500
+        self.dynamic_score_topk = 0
+        self.dynamic_score_stats_filename = "dynamic_score_stats.json"
+        self.dynamic_score_include_values = True
+        self.dynamic_score_hist_bins = 20
         
         super().__init__(parser, "Optimization Parameters")
 

@@ -117,5 +117,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : radii > 0,
             "radii": radii,
             "depth":depth,
+            "deformed_xyz": means3D_final,
             "sh_coefs_final": shs_final,
             "extras":extras,}
