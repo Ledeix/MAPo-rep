@@ -5,7 +5,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from time import time as get_time
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, cam_no=None, iter=None, train_coarse=False, \
-    num_down_emb_c=5, num_down_emb_f=5):
+    num_down_emb_c=5, num_down_emb_f=5, force_segment_id=None):
     """
     Render the scene. 
     
@@ -79,6 +79,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         iter,
         num_down_emb_c=num_down_emb_c,
         num_down_emb_f=num_down_emb_f,
+        force_segment_id=force_segment_id,
     )
 
     scales_final = pc.scaling_activation(scales_final)

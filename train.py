@@ -34,6 +34,84 @@ import torchvision
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 
+def compute_cross_frame_loss(viewpoint_cams, gaussians, pipe, background, iteration, opt):
+    device = gaussians.get_xyz.device
+    zero = torch.zeros([], device=device, dtype=torch.float32)
+
+    if len(viewpoint_cams) == 0:
+        gaussians.segment_manager.update_cross_stats(iteration, 0, 0.0, 0.0, 0.0)
+        return zero, zero, zero
+
+    max_views = max(int(opt.temporal_cross_max_views), 1)
+    sampled = random.sample(viewpoint_cams, k=min(max_views, len(viewpoint_cams)))
+
+    lself_vals = []
+    lgt_vals = []
+    debug_rows = []
+
+    for viewpoint_cam in sampled:
+        if type(viewpoint_cam.original_image) == type(None):
+            viewpoint_cam.load_image()
+
+        t = float(viewpoint_cam.time)
+        seg_id = gaussians.segment_manager.get_segment_for_time(t)
+        if seg_id is None:
+            continue
+
+        dist = gaussians.segment_manager.get_boundary_distance(seg_id, t)
+        if dist > float(opt.temporal_cross_edge_window):
+            continue
+
+        nei_id = gaussians.segment_manager.get_neighbor_segment(seg_id, t)
+        if nei_id is None:
+            continue
+
+        render_cur = render(
+            viewpoint_cam, gaussians, pipe, background,
+            cam_no=viewpoint_cam.cam_no, iter=iteration,
+            num_down_emb_c=gaussians.args.min_embeddings,
+            num_down_emb_f=gaussians.args.min_embeddings,
+        )["render"]
+
+        render_nei = render(
+            viewpoint_cam, gaussians, pipe, background,
+            cam_no=viewpoint_cam.cam_no, iter=iteration,
+            num_down_emb_c=gaussians.args.min_embeddings,
+            num_down_emb_f=gaussians.args.min_embeddings,
+            force_segment_id=nei_id,
+        )["render"]
+
+        gt_image = viewpoint_cam.original_image.cuda()
+        l_self = l1_loss(render_cur.unsqueeze(0), render_nei.unsqueeze(0))
+        l_gt = l1_loss(render_nei.unsqueeze(0), gt_image.unsqueeze(0))
+
+        lself_vals.append(l_self)
+        lgt_vals.append(l_gt)
+        debug_rows.append((t, seg_id, nei_id, dist, float(l_self.item()), float(l_gt.item())))
+
+    if len(lself_vals) == 0:
+        gaussians.segment_manager.update_cross_stats(iteration, 0, 0.0, 0.0, 0.0)
+        return zero, zero, zero
+
+    lself = torch.stack(lself_vals).mean()
+    lgt = torch.stack(lgt_vals).mean()
+    total = float(opt.temporal_cross_lambda1) * lself + float(opt.temporal_cross_lambda2) * lgt
+
+    gaussians.segment_manager.update_cross_stats(
+        iteration,
+        len(lself_vals),
+        float(lself.item()),
+        float(lgt.item()),
+        float(total.item()),
+    )
+
+    if opt.temporal_debug_enable and opt.temporal_debug_interval > 0 and iteration % opt.temporal_debug_interval == 0:
+        for row in debug_rows:
+            print(f"[ITER {iteration}] cross t={row[0]:.4f} seg={row[1]} nei={row[2]} dist={row[3]:.4f} Lself={row[4]:.6f} Lgt={row[5]:.6f}")
+
+    return total, lself, lgt
+
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, tb_writer, train_iter,timer, start_time):
@@ -181,6 +259,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             loss = Ll1 + opt.lambda_dssim * Lssim
         else:
             loss = Ll1
+
+        if opt.enable_temporal_partition and opt.temporal_enable_cross_loss and opt.temporal_cross_interval > 0 and (iteration % opt.temporal_cross_interval == 0):
+            lcross, lcross_self, lcross_gt = compute_cross_frame_loss(viewpoint_cams, gaussians, pipe, background, iteration, opt)
+            loss = loss + lcross
 
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         for i in range(len(Ll1_items)):

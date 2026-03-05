@@ -111,3 +111,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     evaluate(args.model_paths, args.test_paths)
+
+# TORCH_HOME=/home/nvme03/.cache/torch XDG_CACHE_HOME=/home/nvme03/.cache

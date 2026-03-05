@@ -179,6 +179,13 @@ class OptimizationParams(ParamGroup):
         self.temporal_debug_interval = 200
         self.temporal_debug_render_interval = 1000
         self.temporal_debug_render = False
+
+        self.temporal_enable_cross_loss = False
+        self.temporal_cross_interval = 50
+        self.temporal_cross_edge_window = 1.0
+        self.temporal_cross_max_views = 1
+        self.temporal_cross_lambda1 = 1.0
+        self.temporal_cross_lambda2 = 0.5
         
         super().__init__(parser, "Optimization Parameters")
 

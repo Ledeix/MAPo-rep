@@ -40,8 +40,21 @@ class SegmentManager(nn.Module):
         self.records = {0: SegmentRecord(seg_id=0, t_start=0.0, t_end=self.total_time, level=0, parent_seg_id=-1, active=True)}
         self.next_seg_id = 1
         self.tau_by_level = {}
+        self.last_cross_stats = {
+            "iteration": -1,
+            "num_views": 0,
+            "lself": 0.0,
+            "lgt": 0.0,
+            "total": 0.0,
+        }
 
         self.deform_nets = nn.ModuleDict({"0": base_deformation})
+
+    def _to_time_scalar(self, t):
+        time_scalar = float(t)
+        if self.total_time > 1.5 and time_scalar <= 1.0 + 1e-6:
+            time_scalar = time_scalar * self.total_time
+        return time_scalar
 
     def get_net(self, seg_id: int):
         return self.deform_nets[str(int(seg_id))]
@@ -67,7 +80,8 @@ class SegmentManager(nn.Module):
         self.deform_nets[str(seg_id)] = copy.deepcopy(parent_net)
         return seg_id
 
-    def forward_deformation(self, pc, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx, num_down_emb_c=30, num_down_emb_f=30):
+    def forward_deformation(self, pc, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx,
+                            num_down_emb_c=30, num_down_emb_f=30, force_segment_id=None):
         if means3D.shape[0] == 0:
             empty_mask = torch.zeros((0,), device=means3D.device, dtype=torch.bool)
             out = (means3D, scales, rotations, opacity, shs, None)
@@ -76,10 +90,7 @@ class SegmentManager(nn.Module):
         if time.numel() == 0:
             time_scalar = 0.0
         else:
-            time_scalar = float(time.reshape(-1)[0].item())
-
-        if self.total_time > 1.5 and time_scalar <= 1.0 + 1e-6:
-            time_scalar = time_scalar * self.total_time
+            time_scalar = self._to_time_scalar(time.reshape(-1)[0].item())
 
         if not self.enabled:
             return pc._deformation(
@@ -87,7 +98,10 @@ class SegmentManager(nn.Module):
                 iter=iter_idx, num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f,
             ), torch.ones((means3D.shape[0],), device=means3D.device, dtype=torch.bool)
 
-        active_mask = (time_scalar >= pc._t_start_g) & (time_scalar < pc._t_end_g)
+        if force_segment_id is None:
+            active_mask = (time_scalar >= pc._t_start_g) & (time_scalar < pc._t_end_g)
+        else:
+            active_mask = (pc._seg_id_g == int(force_segment_id)) & (time_scalar >= pc._t_start_g) & (time_scalar < pc._t_end_g)
 
         means3D_final = means3D.clone()
         scales_final = scales.clone()
@@ -97,7 +111,10 @@ class SegmentManager(nn.Module):
         extras = None
 
         if active_mask.any():
-            seg_ids = torch.unique(pc._seg_id_g[active_mask])
+            if force_segment_id is None:
+                seg_ids = torch.unique(pc._seg_id_g[active_mask])
+            else:
+                seg_ids = torch.tensor([int(force_segment_id)], device=pc._seg_id_g.device, dtype=pc._seg_id_g.dtype)
             for seg_id_tensor in seg_ids:
                 seg_id = int(seg_id_tensor.item())
                 idx = torch.where(active_mask & (pc._seg_id_g == seg_id))[0]
@@ -130,6 +147,58 @@ class SegmentManager(nn.Module):
             opacity_final[inactive_mask] = -100.0
 
         return (means3D_final, scales_final, rotations_final, opacity_final, shs_final, extras), active_mask
+
+    def get_segment_for_time(self, t):
+        t = self._to_time_scalar(t)
+        covering = [rec for rec in self.records.values() if rec.active and rec.t_start <= t < rec.t_end]
+        if len(covering) == 0:
+            return None
+        covering.sort(key=lambda r: (r.level, r.t_end - r.t_start), reverse=True)
+        return int(covering[0].seg_id)
+
+    def get_boundary_distance(self, seg_id, t):
+        rec = self.records.get(int(seg_id), None)
+        if rec is None:
+            return float("inf")
+        t = self._to_time_scalar(t)
+        return min(abs(t - rec.t_start), abs(t - rec.t_end))
+
+    def get_neighbor_segment(self, seg_id, t):
+        seg_id = int(seg_id)
+        rec = self.records.get(seg_id, None)
+        if rec is None:
+            return None
+
+        siblings = [
+            s for s in self.records.values()
+            if s.active and s.seg_id != seg_id and s.parent_seg_id == rec.parent_seg_id and s.level == rec.level
+        ]
+        if len(siblings) > 0:
+            siblings.sort(key=lambda s: min(abs(rec.t_start - s.t_end), abs(rec.t_end - s.t_start)))
+            return int(siblings[0].seg_id)
+
+        candidates = [s for s in self.records.values() if s.active and s.seg_id != seg_id]
+        if len(candidates) == 0:
+            return None
+
+        t = self._to_time_scalar(t)
+
+        def _score(s):
+            edge_gap = min(abs(rec.t_start - s.t_end), abs(rec.t_end - s.t_start))
+            boundary_dist = min(abs(t - s.t_start), abs(t - s.t_end))
+            return (edge_gap, boundary_dist)
+
+        candidates.sort(key=_score)
+        return int(candidates[0].seg_id)
+
+    def update_cross_stats(self, iteration, num_views, lself, lgt, total):
+        self.last_cross_stats = {
+            "iteration": int(iteration),
+            "num_views": int(num_views),
+            "lself": float(lself),
+            "lgt": float(lgt),
+            "total": float(total),
+        }
 
     @torch.no_grad()
     def update_taus(self, gaussians):
@@ -300,6 +369,7 @@ class SegmentManager(nn.Module):
             "tau_by_level": {str(k): float(v) for k, v in self.tau_by_level.items()},
             "level_stats": by_level,
             "settings": settings_dict or {},
+            "cross_loss": self.last_cross_stats,
         }
 
         out_path = os.path.join(debug_dir, f"segments_iter{iteration:06d}.json")

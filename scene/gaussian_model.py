@@ -350,10 +350,10 @@ class GaussianModel:
             self._registered_segment_ids.add(seg_id)
 
     def apply_segmented_deformation(self, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx,
-                                    num_down_emb_c=30, num_down_emb_f=30):
+                                    num_down_emb_c=30, num_down_emb_f=30, force_segment_id=None):
         return self.segment_manager.forward_deformation(
             self, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx,
-            num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f,
+            num_down_emb_c=num_down_emb_c, num_down_emb_f=num_down_emb_f, force_segment_id=force_segment_id,
         )
 
     def append_gaussian_clones(self, parent_indices, current_iter=0):
