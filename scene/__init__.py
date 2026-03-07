@@ -121,10 +121,11 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
-            self.gaussians.load_model(os.path.join(self.model_path,
-                                                    "point_cloud",
-                                                    "iteration_" + str(self.loaded_iter),
-                                                   ))
+            iter_path = os.path.join(self.model_path,
+                                     "point_cloud",
+                                     "iteration_" + str(self.loaded_iter))
+            self.gaussians.load_model(iter_path)
+            self.gaussians.load_temporal_static_state(iter_path)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, self.maxtime)
 
@@ -133,6 +134,7 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         self.gaussians.save_deformation(point_cloud_path)
+        self.gaussians.save_temporal_static_state(point_cloud_path)
     
     def recordpoints(self, iteration, string):
         txtpath = os.path.join(self.model_path, "exp_log.txt")

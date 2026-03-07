@@ -69,6 +69,13 @@ class GaussianModel:
         self._t_start_g = torch.empty(0)
         self._t_end_g = torch.empty(0)
         self._level_g = torch.empty(0, dtype=torch.int32)
+        self._is_static_g = torch.empty(0, dtype=torch.bool)
+        self._xyz_static = torch.empty(0)
+        self._rotation_static = torch.empty(0)
+        self._scaling_static = torch.empty(0)
+        self._features_dc_static = torch.empty(0)
+        self._features_rest_static = torch.empty(0)
+        self._opacity_static = torch.empty(0)
         self._dyn_history = None
         self._dyn_history_ptr = 0
         self._dyn_history_count = 0
@@ -113,43 +120,59 @@ class GaussianModel:
             self.segment_manager.records,
             self.segment_manager.next_seg_id,
             self.segment_manager.tau_by_level,
+            self._is_static_g,
+            self._xyz_static,
+            self._rotation_static,
+            self._scaling_static,
+            self._features_dc_static,
+            self._features_rest_static,
+            self._opacity_static,
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) >= 24:
-            (self.active_sh_degree,
-            self._xyz,
-            self._deformation,
-            self._features_dc,
-            self._features_rest,
-            self._embedding,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            xyz_gradient_accum,
-            denom,
-            opt_dict,
-            self.spatial_lr_scale,
-            self._dyn_score,
-            self._dyn_obs,
-            self._birth_iter,
-            self._seg_id_g,
-            self._t_start_g,
-            self._t_end_g,
-            self._level_g,
-            segment_manager_state,
-            segment_records,
-            segment_next_seg_id,
-            segment_tau_by_level) = model_args
-            self.segment_manager.load_state_dict(segment_manager_state)
-            self.segment_manager.records = segment_records
-            self.segment_manager.next_seg_id = segment_next_seg_id
-            self.segment_manager.tau_by_level = segment_tau_by_level
+        segment_manager_state = None
+        segment_records = None
+        segment_next_seg_id = None
+        segment_tau_by_level = None
+        static_payload = None
+
+        if len(model_args) >= 25:
+            self.active_sh_degree = model_args[0]
+            self._xyz = model_args[1]
+            deformation_payload = model_args[2]
+            self._features_dc = model_args[3]
+            self._features_rest = model_args[4]
+            self._scaling = model_args[5]
+            self._rotation = model_args[6]
+            self._opacity = model_args[7]
+            self._embedding = model_args[8]
+            self.max_radii2D = model_args[9]
+            xyz_gradient_accum = model_args[10]
+            denom = model_args[11]
+            opt_dict = model_args[12]
+            self.spatial_lr_scale = model_args[13]
+            self._dyn_score = model_args[14]
+            self._dyn_obs = model_args[15]
+            self._birth_iter = model_args[16]
+            self._seg_id_g = model_args[17]
+            self._t_start_g = model_args[18]
+            self._t_end_g = model_args[19]
+            self._level_g = model_args[20]
+            segment_manager_state = model_args[21]
+            segment_records = model_args[22]
+            segment_next_seg_id = model_args[23]
+            segment_tau_by_level = model_args[24]
+            if len(model_args) >= 32:
+                static_payload = model_args[25:32]
+
+            if isinstance(deformation_payload, dict):
+                self._deformation.load_state_dict(deformation_payload)
+            else:
+                self._deformation = deformation_payload
         else:
             (self.active_sh_degree,
             self._xyz,
-            self._deformation,
+            deformation_payload,
             self._features_dc,
             self._features_rest,
             self._embedding,
@@ -161,12 +184,46 @@ class GaussianModel:
             denom,
             opt_dict,
             self.spatial_lr_scale) = model_args
+            if isinstance(deformation_payload, dict):
+                self._deformation.load_state_dict(deformation_payload)
+            else:
+                self._deformation = deformation_payload
             self._initialize_dynamic_states(self._xyz.shape[0], current_iter=0, device=self._xyz.device)
             self._initialize_segment_states(self._xyz.shape[0], device=self._xyz.device)
+
+        if segment_manager_state is not None:
+            self.segment_manager.ensure_nets_for_records(segment_records)
+            self.segment_manager.load_state_dict(segment_manager_state)
+            self.segment_manager.records = segment_records
+            self.segment_manager.next_seg_id = segment_next_seg_id
+            self.segment_manager.tau_by_level = segment_tau_by_level
+
+        if static_payload is None:
+            self._initialize_static_states(self._xyz.shape[0], device=self._xyz.device)
+        else:
+            (self._is_static_g,
+             self._xyz_static,
+             self._rotation_static,
+             self._scaling_static,
+             self._features_dc_static,
+             self._features_rest_static,
+             self._opacity_static) = static_payload
+            self._is_static_g = self._is_static_g.to(self._xyz.device, dtype=torch.bool)
+            self._xyz_static = nn.Parameter(self._xyz_static.to(self._xyz.device).requires_grad_(True))
+            self._rotation_static = nn.Parameter(self._rotation_static.to(self._xyz.device).requires_grad_(True))
+            self._scaling_static = nn.Parameter(self._scaling_static.to(self._xyz.device).requires_grad_(True))
+            self._features_dc_static = nn.Parameter(self._features_dc_static.to(self._xyz.device).requires_grad_(True))
+            self._features_rest_static = nn.Parameter(self._features_rest_static.to(self._xyz.device).requires_grad_(True))
+            self._opacity_static = nn.Parameter(self._opacity_static.to(self._xyz.device).requires_grad_(True))
+
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        try:
+            self.optimizer.load_state_dict(opt_dict)
+        except ValueError:
+            # Allow restoring checkpoints created before static partition params existed.
+            pass
         self._dyn_score = self._dyn_score.to(self._xyz.device, dtype=torch.float32)
         self._dyn_obs = self._dyn_obs.to(self._xyz.device, dtype=torch.long)
         self._birth_iter = self._birth_iter.to(self._xyz.device, dtype=torch.long)
@@ -174,6 +231,7 @@ class GaussianModel:
         self._t_start_g = self._t_start_g.to(self._xyz.device, dtype=torch.float32)
         self._t_end_g = self._t_end_g.to(self._xyz.device, dtype=torch.float32)
         self._level_g = self._level_g.to(self._xyz.device, dtype=torch.int32)
+        self._is_static_g = self._is_static_g.to(self._xyz.device, dtype=torch.bool)
         self.assert_metadata_alignment()
 
     @property
@@ -291,6 +349,29 @@ class GaussianModel:
         self._t_end_g = torch.full((num_points,), float(self.total_time), device=device, dtype=torch.float32)
         self._level_g = torch.zeros((num_points,), device=device, dtype=torch.int32)
 
+    def _initialize_static_states(self, num_points, device=None):
+        if device is None:
+            device = self._xyz.device if self._xyz.numel() > 0 else "cuda"
+        self._is_static_g = torch.zeros((num_points,), device=device, dtype=torch.bool)
+        self._xyz_static = nn.Parameter(self._xyz.detach().clone().to(device).requires_grad_(True))
+        self._rotation_static = nn.Parameter(self._rotation.detach().clone().to(device).requires_grad_(True))
+        self._scaling_static = nn.Parameter(self._scaling.detach().clone().to(device).requires_grad_(True))
+        self._features_dc_static = nn.Parameter(self._features_dc.detach().clone().to(device).requires_grad_(True))
+        self._features_rest_static = nn.Parameter(self._features_rest.detach().clone().to(device).requires_grad_(True))
+        self._opacity_static = nn.Parameter(self._opacity.detach().clone().to(device).requires_grad_(True))
+
+    def _append_static_states(self, new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation):
+        new_count = int(new_xyz.shape[0])
+        if new_count <= 0:
+            return
+        self._is_static_g = torch.cat([
+            self._is_static_g,
+            torch.zeros((new_count,), device=self._xyz.device, dtype=torch.bool)
+        ], dim=0)
+
+    def _prune_static_states(self, valid_points_mask):
+        self._is_static_g = self._is_static_g[valid_points_mask]
+
     def _append_segment_states(self, parent_indices=None, new_count=0):
         if parent_indices is not None:
             parent_indices = parent_indices.long().to(self._xyz.device)
@@ -329,6 +410,17 @@ class GaussianModel:
         assert self._t_start_g.shape[0] == n
         assert self._t_end_g.shape[0] == n
         assert self._level_g.shape[0] == n
+        assert self._is_static_g.shape[0] == n
+        assert self._xyz_static.shape[0] == n
+        assert self._rotation_static.shape[0] == n
+        assert self._scaling_static.shape[0] == n
+        assert self._features_dc_static.shape[0] == n
+        assert self._features_rest_static.shape[0] == n
+        assert self._opacity_static.shape[0] == n
+
+    @property
+    def get_static_features(self):
+        return torch.cat((self._features_dc_static, self._features_rest_static), dim=1)
 
     def register_new_segment_optimizer_params(self, seg_ids):
         if self.optimizer is None or self._training_args is None:
@@ -382,6 +474,84 @@ class GaussianModel:
             current_iter=current_iter,
         )
         return torch.arange(old_n, self.get_xyz.shape[0], device=self._xyz.device, dtype=torch.long)
+
+    @torch.no_grad()
+    def update_static_partition(self, current_iter: int, static_tau: float, min_obs: int, max_new: int, segment_manager, total_T) -> dict:
+        num_total = int(self.get_xyz.shape[0])
+        if num_total == 0:
+            return {"iteration": int(current_iter), "num_marked": 0, "num_static_total": 0, "num_candidates": 0, "static_tau": float(static_tau)}
+
+        mature = self._dyn_obs >= int(min_obs)
+        candidates = mature & (self._dyn_score < float(static_tau)) & (~self._is_static_g)
+        cand_idx = torch.where(candidates)[0]
+        num_candidates = int(cand_idx.numel())
+        if num_candidates == 0:
+            return {
+                "iteration": int(current_iter),
+                "num_marked": 0,
+                "num_static_total": int(self._is_static_g.sum().item()),
+                "num_candidates": 0,
+                "static_tau": float(static_tau),
+            }
+
+        max_new = int(max_new)
+        if max_new > 0 and cand_idx.numel() > max_new:
+            perm = torch.randperm(cand_idx.numel(), device=cand_idx.device)[:max_new]
+            cand_idx = cand_idx[perm]
+
+        t_start = self._t_start_g[cand_idx]
+        t_end = self._t_end_g[cand_idx]
+        valid_span = torch.clamp(t_end - t_start, min=1e-6)
+        bake_random = bool(getattr(self._training_args, "static_bake_random_time", True))
+        if bake_random:
+            rand_u = torch.rand((cand_idx.shape[0],), device=self._xyz.device, dtype=torch.float32)
+            t_values = (t_start + rand_u * valid_span).unsqueeze(-1)
+        else:
+            t_values = ((t_start + t_end) * 0.5).unsqueeze(-1)
+
+        (xyz_b, scale_b, rot_b, opa_b, shs_b, _) = segment_manager.deform_subset(
+            self,
+            cand_idx,
+            t_values,
+            cam_no=None,
+            iter_idx=int(current_iter),
+            num_down_emb_c=getattr(self.args, "min_embeddings", 30),
+            num_down_emb_f=getattr(self.args, "min_embeddings", 30),
+        )
+
+        self._xyz_static[cand_idx] = xyz_b
+        self._scaling_static[cand_idx] = scale_b
+        self._rotation_static[cand_idx] = rot_b
+        self._opacity_static[cand_idx] = opa_b
+        self._features_dc_static[cand_idx] = shs_b[:, :self._features_dc.shape[1], :]
+        self._features_rest_static[cand_idx] = shs_b[:, self._features_dc.shape[1]:, :]
+        self._is_static_g[cand_idx] = True
+
+        return {
+            "iteration": int(current_iter),
+            "num_marked": int(cand_idx.numel()),
+            "num_static_total": int(self._is_static_g.sum().item()),
+            "num_candidates": num_candidates,
+            "static_tau": float(static_tau),
+            "min_obs": int(min_obs),
+            "static_ratio": float(self._is_static_g.float().mean().item()),
+            "total_T": float(total_T),
+        }
+
+    @torch.no_grad()
+    def get_static_brief(self):
+        n = int(self.get_xyz.shape[0])
+        if n == 0:
+            return {"num_static": 0, "num_total": 0, "ratio": 0.0, "mean_dyn_static": 0.0}
+        static_count = int(self._is_static_g.sum().item())
+        if static_count == 0:
+            return {"num_static": 0, "num_total": n, "ratio": 0.0, "mean_dyn_static": 0.0}
+        return {
+            "num_static": static_count,
+            "num_total": n,
+            "ratio": float(static_count / max(n, 1)),
+            "mean_dyn_static": float(self._dyn_score[self._is_static_g].mean().item()),
+        }
 
     @staticmethod
     def _percentile_normalize(values, low_percentile, high_percentile, eps=1e-6):
@@ -540,6 +710,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._initialize_dynamic_states(self.get_xyz.shape[0], current_iter=0, device=self._xyz.device)
         self._initialize_segment_states(self.get_xyz.shape[0], device=self._xyz.device)
+        self._initialize_static_states(self.get_xyz.shape[0], device=self._xyz.device)
         self.assert_metadata_alignment()
 
     def training_setup(self, training_args):
@@ -558,7 +729,13 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._embedding], 'lr': training_args.feature_lr, "name": "embedding"}
+            {'params': [self._embedding], 'lr': training_args.feature_lr, "name": "embedding"},
+            {'params': [self._xyz_static], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz_static"},
+            {'params': [self._features_dc_static], 'lr': training_args.feature_lr, "name": "f_dc_static"},
+            {'params': [self._features_rest_static], 'lr': training_args.feature_lr / training_args.feature_lr_div_factor, "name": "f_rest_static"},
+            {'params': [self._opacity_static], 'lr': training_args.opacity_lr, "name": "opacity_static"},
+            {'params': [self._scaling_static], 'lr': training_args.scaling_lr, "name": "scaling_static"},
+            {'params': [self._rotation_static], 'lr': training_args.rotation_lr, "name": "rotation_static"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -600,12 +777,86 @@ class GaussianModel:
     def load_model(self, path):
         print("loading model from exists{}".format(path))
         weight_dict = torch.load(os.path.join(path,"deformation.pth"),map_location="cuda")
+        if isinstance(weight_dict, dict) and "deformation_state" in weight_dict:
+            # Backward-compatible loading if deformation checkpoint stores extra payload.
+            weight_dict = weight_dict["deformation_state"]
         self._deformation.load_state_dict(weight_dict)
         self._deformation = self._deformation.to("cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def save_deformation(self, path):
         torch.save(self._deformation.state_dict(),os.path.join(path, "deformation.pth"))
+
+    def save_temporal_static_state(self, path):
+        payload = {
+            "dyn_score": self._dyn_score.detach().cpu(),
+            "dyn_obs": self._dyn_obs.detach().cpu(),
+            "birth_iter": self._birth_iter.detach().cpu(),
+            "seg_id_g": self._seg_id_g.detach().cpu(),
+            "t_start_g": self._t_start_g.detach().cpu(),
+            "t_end_g": self._t_end_g.detach().cpu(),
+            "level_g": self._level_g.detach().cpu(),
+            "is_static_g": self._is_static_g.detach().cpu(),
+            "xyz_static": self._xyz_static.detach().cpu(),
+            "rotation_static": self._rotation_static.detach().cpu(),
+            "scaling_static": self._scaling_static.detach().cpu(),
+            "features_dc_static": self._features_dc_static.detach().cpu(),
+            "features_rest_static": self._features_rest_static.detach().cpu(),
+            "opacity_static": self._opacity_static.detach().cpu(),
+            "segment_manager_state": self.segment_manager.state_dict(),
+            "segment_records": self.segment_manager.records,
+            "segment_next_seg_id": self.segment_manager.next_seg_id,
+            "segment_tau_by_level": self.segment_manager.tau_by_level,
+            "segment_enabled": bool(self.segment_manager.enabled),
+            "total_time": float(self.total_time),
+        }
+        torch.save(payload, os.path.join(path, "temporal_static_state.pth"))
+
+    def load_temporal_static_state(self, path):
+        state_path = os.path.join(path, "temporal_static_state.pth")
+        if not os.path.exists(state_path):
+            return False
+
+        payload = torch.load(state_path, map_location="cpu")
+        device = self._xyz.device
+
+        self._dyn_score = payload["dyn_score"].to(device=device, dtype=torch.float32)
+        self._dyn_obs = payload["dyn_obs"].to(device=device, dtype=torch.long)
+        self._birth_iter = payload["birth_iter"].to(device=device, dtype=torch.long)
+
+        self._seg_id_g = payload["seg_id_g"].to(device=device, dtype=torch.int32)
+        self._t_start_g = payload["t_start_g"].to(device=device, dtype=torch.float32)
+        self._t_end_g = payload["t_end_g"].to(device=device, dtype=torch.float32)
+        self._level_g = payload["level_g"].to(device=device, dtype=torch.int32)
+
+        self._is_static_g = payload["is_static_g"].to(device=device, dtype=torch.bool)
+        self._xyz_static = nn.Parameter(payload["xyz_static"].to(device=device, dtype=self._xyz.dtype).requires_grad_(True))
+        self._rotation_static = nn.Parameter(payload["rotation_static"].to(device=device, dtype=self._rotation.dtype).requires_grad_(True))
+        self._scaling_static = nn.Parameter(payload["scaling_static"].to(device=device, dtype=self._scaling.dtype).requires_grad_(True))
+        self._features_dc_static = nn.Parameter(payload["features_dc_static"].to(device=device, dtype=self._features_dc.dtype).requires_grad_(True))
+        self._features_rest_static = nn.Parameter(payload["features_rest_static"].to(device=device, dtype=self._features_rest.dtype).requires_grad_(True))
+        self._opacity_static = nn.Parameter(payload["opacity_static"].to(device=device, dtype=self._opacity.dtype).requires_grad_(True))
+
+        seg_records = payload.get("segment_records", None)
+        seg_state = payload.get("segment_manager_state", None)
+        if seg_records is not None:
+            self.segment_manager.records = seg_records
+        if "segment_next_seg_id" in payload:
+            self.segment_manager.next_seg_id = int(payload["segment_next_seg_id"])
+        if "segment_tau_by_level" in payload:
+            self.segment_manager.tau_by_level = payload["segment_tau_by_level"]
+        if "segment_enabled" in payload:
+            self.segment_manager.enabled = bool(payload["segment_enabled"])
+        if "total_time" in payload:
+            self.total_time = float(payload["total_time"])
+            self.segment_manager.total_time = float(payload["total_time"])
+
+        if seg_state is not None:
+            self.segment_manager.ensure_nets_for_records(self.segment_manager.records)
+            self.segment_manager.load_state_dict(seg_state)
+
+        self.assert_metadata_alignment()
+        return True
         
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
@@ -686,6 +937,7 @@ class GaussianModel:
         self.active_sh_degree = self.max_sh_degree
         self._initialize_dynamic_states(self.get_xyz.shape[0], current_iter=0, device=self._xyz.device)
         self._initialize_segment_states(self.get_xyz.shape[0], device=self._xyz.device)
+        self._initialize_static_states(self.get_xyz.shape[0], device=self._xyz.device)
         self.assert_metadata_alignment()
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -734,11 +986,18 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._embedding = optimizable_tensors["embedding"]
+        self._xyz_static = optimizable_tensors["xyz_static"]
+        self._features_dc_static = optimizable_tensors["f_dc_static"]
+        self._features_rest_static = optimizable_tensors["f_rest_static"]
+        self._opacity_static = optimizable_tensors["opacity_static"]
+        self._scaling_static = optimizable_tensors["scaling_static"]
+        self._rotation_static = optimizable_tensors["rotation_static"]
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self._prune_dynamic_states(valid_points_mask)
         self._prune_segment_states(valid_points_mask)
+        self._prune_static_states(valid_points_mask)
         self.assert_metadata_alignment()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -773,6 +1032,12 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         "embedding" : new_embedding,
+        "xyz_static": new_xyz.detach().clone(),
+        "f_dc_static": new_features_dc.detach().clone(),
+        "f_rest_static": new_features_rest.detach().clone(),
+        "opacity_static": new_opacities.detach().clone(),
+        "scaling_static": new_scaling.detach().clone(),
+        "rotation_static": new_rotation.detach().clone(),
        }
         
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -783,12 +1048,19 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._embedding = optimizable_tensors["embedding"]
+        self._xyz_static = optimizable_tensors["xyz_static"]
+        self._features_dc_static = optimizable_tensors["f_dc_static"]
+        self._features_rest_static = optimizable_tensors["f_rest_static"]
+        self._opacity_static = optimizable_tensors["opacity_static"]
+        self._scaling_static = optimizable_tensors["scaling_static"]
+        self._rotation_static = optimizable_tensors["rotation_static"]
         
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._append_dynamic_states(parent_indices=parent_indices, current_iter=current_iter)
         self._append_segment_states(parent_indices=parent_indices)
+        self._append_static_states(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
         self.assert_metadata_alignment()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, current_iter=0):

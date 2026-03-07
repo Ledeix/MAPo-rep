@@ -13,6 +13,7 @@ import numpy as np
 import random
 import os
 import torch
+import atexit
 from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
 from gaussian_renderer import render, network_gui
@@ -32,6 +33,50 @@ from utils.scene_utils import render_training_image
 from time import time
 import torchvision
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
+
+
+_LOG_TEE = None
+
+
+class _TeeStream:
+    def __init__(self, stream, file_path):
+        self._stream = stream
+        self._file = open(file_path, "a", encoding="utf-8")
+
+    def write(self, data):
+        self._stream.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+    def close_file(self):
+        try:
+            self._file.flush()
+            self._file.close()
+        except Exception:
+            pass
+
+
+def _setup_train_logger(model_path):
+    global _LOG_TEE
+    if _LOG_TEE is not None:
+        return
+    log_path = os.path.join(model_path, "train_log.txt")
+    stdout_tee = _TeeStream(sys.stdout, log_path)
+    stderr_tee = _TeeStream(sys.stderr, log_path)
+    sys.stdout = stdout_tee
+    sys.stderr = stderr_tee
+    _LOG_TEE = (stdout_tee, stderr_tee)
+
+    def _cleanup():
+        for tee in _LOG_TEE or []:
+            tee.close_file()
+    atexit.register(_cleanup)
 
 
 def compute_cross_frame_loss(viewpoint_cams, gaussians, pipe, background, iteration, opt):
@@ -338,9 +383,35 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if opt.dynamic_score_topk > 0:
                     topk_path = os.path.join(args.model_path, f"dynamic_score_topk_{iteration:06d}.json")
                     gaussians.export_topk_dynamic_scores(topk_path, topk=opt.dynamic_score_topk, min_obs=opt.dynamic_score_min_obs)
+                if opt.enable_static_partition:
+                    static_brief = gaussians.get_static_brief()
+                    print(
+                        f"[ITER {iteration}] static(mean_dyn={static_brief['mean_dyn_static']:.6f}, "
+                        f"ratio={static_brief['ratio']*100:.2f}% [{static_brief['num_static']}/{static_brief['num_total']}])"
+                    )
 
             if opt.enable_temporal_partition and iteration % opt.temporal_tau_interval == 0:
                 gaussians.segment_manager.update_taus(gaussians)
+
+            if (
+                opt.enable_temporal_partition
+                and opt.enable_static_partition
+                and opt.static_update_interval > 0
+                and iteration % opt.static_update_interval == 0
+            ):
+                stats = gaussians.update_static_partition(
+                    current_iter=iteration,
+                    static_tau=opt.static_tau,
+                    min_obs=opt.static_min_obs,
+                    max_new=opt.static_max_new_per_update,
+                    segment_manager=gaussians.segment_manager,
+                    total_T=scene.maxtime,
+                )
+                if opt.static_debug_log_interval > 0 and iteration % opt.static_debug_log_interval == 0:
+                    print(
+                        f"[ITER {iteration}] static_partition: marked={stats['num_marked']} "
+                        f"total_static={stats['num_static_total']} tau={stats['static_tau']}"
+                    )
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -442,6 +513,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     dyn_img = render(debug_cam, gaussians, pipe, background, iter=iteration, override_color=dyn_colors)["render"]
                     torchvision.utils.save_image(dyn_img, os.path.join(debug_dir, f"dynamic_mask_iter{iteration:06d}.png"))
 
+                    if opt.enable_static_partition:
+                        static_colors = torch.full((gaussians.get_xyz.shape[0], 3), 0.5, device=gaussians.get_xyz.device)
+                        static_colors[gaussians._is_static_g] = torch.tensor([0.0, 1.0, 0.0], device=gaussians.get_xyz.device)
+                        static_img = render(debug_cam, gaussians, pipe, background, iter=iteration, override_color=static_colors)["render"]
+                        torchvision.utils.save_image(static_img, os.path.join(debug_dir, f"static_mask_iter{iteration:06d}.png"))
+
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
@@ -491,6 +568,8 @@ def prepare_output_and_logger(expname):
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
+    _setup_train_logger(args.model_path)
+    print("Training logs will be saved to: {}".format(os.path.join(args.model_path, "train_log.txt")))
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 

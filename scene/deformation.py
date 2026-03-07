@@ -62,7 +62,7 @@ class deform_network(nn.Module):
         grid = (grid - 0.5) * 2
 
         emb = F.grid_sample(emb_resized, grid, align_corners=align_corners, mode='bilinear', padding_mode='reflection')
-        emb = emb.repeat(1,1,N,1).squeeze()
+        emb = emb.repeat(1, 1, N, 1).reshape(N, self.temporal_embedding_dim)
 
         return emb
     

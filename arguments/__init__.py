@@ -186,6 +186,15 @@ class OptimizationParams(ParamGroup):
         self.temporal_cross_max_views = 1
         self.temporal_cross_lambda1 = 1.0
         self.temporal_cross_lambda2 = 0.5
+
+        self.enable_static_partition = False
+        self.static_tau = 0.03
+        self.static_min_obs = self.dynamic_score_min_obs
+        self.static_update_interval = 2000
+        self.static_max_new_per_update = 50000
+        self.static_bake_random_time = True
+        self.static_debug_log_interval = 2000
+        self.static_freeze_deform_for_static = True
         
         super().__init__(parser, "Optimization Parameters")
 

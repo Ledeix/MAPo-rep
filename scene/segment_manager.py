@@ -80,6 +80,77 @@ class SegmentManager(nn.Module):
         self.deform_nets[str(seg_id)] = copy.deepcopy(parent_net)
         return seg_id
 
+    def ensure_nets_for_records(self, records):
+        # Recreate missing per-segment deformation nets before loading a state dict.
+        if records is None:
+            return
+        for seg_id in sorted([int(k) for k in records.keys()]):
+            key = str(seg_id)
+            if key in self.deform_nets:
+                continue
+            rec = records[seg_id]
+            parent_id = int(rec.parent_seg_id)
+            parent_key = str(parent_id) if parent_id >= 0 and str(parent_id) in self.deform_nets else "0"
+            self.deform_nets[key] = copy.deepcopy(self.deform_nets[parent_key])
+
+    def deform_subset(self, pc, idx_tensor, time_values, cam_no=None, iter_idx=0, num_down_emb_c=30, num_down_emb_f=30):
+        if idx_tensor.numel() == 0:
+            empty_xyz = torch.empty((0, 3), device=pc.get_xyz.device, dtype=pc.get_xyz.dtype)
+            empty_scale = torch.empty((0, pc._scaling.shape[1]), device=pc.get_xyz.device, dtype=pc._scaling.dtype)
+            empty_rot = torch.empty((0, pc._rotation.shape[1]), device=pc.get_xyz.device, dtype=pc._rotation.dtype)
+            empty_opa = torch.empty((0, pc._opacity.shape[1]), device=pc.get_xyz.device, dtype=pc._opacity.dtype)
+            empty_shs = torch.empty((0, pc.get_features.shape[1], pc.get_features.shape[2]), device=pc.get_xyz.device, dtype=pc.get_features.dtype)
+            return empty_xyz, empty_scale, empty_rot, empty_opa, empty_shs, None
+
+        idx_tensor = idx_tensor.long().to(pc.get_xyz.device)
+        if time_values.ndim == 1:
+            time_values = time_values.unsqueeze(-1)
+        time_values = time_values.to(pc.get_xyz.device, dtype=pc.get_xyz.dtype)
+
+        means = pc._xyz[idx_tensor]
+        scales = pc._scaling[idx_tensor]
+        rotations = pc._rotation[idx_tensor]
+        opacity = pc._opacity[idx_tensor]
+        shs = pc.get_features[idx_tensor]
+        seg_ids = pc._seg_id_g[idx_tensor]
+
+        means_out = means.clone()
+        scales_out = scales.clone()
+        rotations_out = rotations.clone()
+        opacity_out = opacity.clone()
+        shs_out = shs.clone()
+        extras = None
+
+        for seg_id_tensor in torch.unique(seg_ids):
+            seg_id = int(seg_id_tensor.item())
+            local_idx = torch.where(seg_ids == seg_id)[0]
+            if local_idx.numel() == 0:
+                continue
+            global_idx = idx_tensor[local_idx]
+            net = self.get_net(seg_id)
+            out = net(
+                means[local_idx],
+                scales=scales[local_idx],
+                rotations=rotations[local_idx],
+                opacity=opacity[local_idx],
+                time_emb=time_values[local_idx],
+                cam_no=cam_no,
+                pc=None,
+                embeddings=pc.get_embedding[global_idx],
+                sh_coefs=shs[local_idx],
+                iter=iter_idx,
+                num_down_emb_c=num_down_emb_c,
+                num_down_emb_f=num_down_emb_f,
+            )
+            means_out[local_idx] = out[0]
+            scales_out[local_idx] = out[1]
+            rotations_out[local_idx] = out[2]
+            opacity_out[local_idx] = out[3]
+            shs_out[local_idx] = out[4]
+            extras = out[5]
+
+        return means_out, scales_out, rotations_out, opacity_out, shs_out, extras
+
     def forward_deformation(self, pc, means3D, scales, rotations, opacity, time, cam_no, shs, iter_idx,
                             num_down_emb_c=30, num_down_emb_f=30, force_segment_id=None):
         if means3D.shape[0] == 0:
@@ -110,14 +181,25 @@ class SegmentManager(nn.Module):
         shs_final = shs.clone()
         extras = None
 
-        if active_mask.any():
+        freeze_static = bool(getattr(pc._training_args, "static_freeze_deform_for_static", True)) if pc._training_args is not None else True
+        active_static = active_mask & pc._is_static_g if freeze_static else torch.zeros_like(active_mask)
+        active_dynamic = active_mask & (~active_static)
+
+        if active_static.any():
+            means3D_final[active_static] = pc._xyz_static[active_static]
+            scales_final[active_static] = pc._scaling_static[active_static]
+            rotations_final[active_static] = pc._rotation_static[active_static]
+            opacity_final[active_static] = pc._opacity_static[active_static]
+            shs_final[active_static] = pc.get_static_features[active_static]
+
+        if active_dynamic.any():
             if force_segment_id is None:
-                seg_ids = torch.unique(pc._seg_id_g[active_mask])
+                seg_ids = torch.unique(pc._seg_id_g[active_dynamic])
             else:
                 seg_ids = torch.tensor([int(force_segment_id)], device=pc._seg_id_g.device, dtype=pc._seg_id_g.dtype)
             for seg_id_tensor in seg_ids:
                 seg_id = int(seg_id_tensor.item())
-                idx = torch.where(active_mask & (pc._seg_id_g == seg_id))[0]
+                idx = torch.where(active_dynamic & (pc._seg_id_g == seg_id))[0]
                 if idx.numel() == 0:
                     continue
                 net = self.get_net(seg_id)
@@ -291,6 +373,22 @@ class SegmentManager(nn.Module):
         gaussians._level_g[new_idx] = int(next_level)
         gaussians._dyn_obs[new_idx] = 0
         gaussians._birth_iter[new_idx] = int(current_iter)
+
+        gaussians._is_static_g[idx] = False
+        gaussians._xyz_static[idx] = gaussians._xyz[idx]
+        gaussians._scaling_static[idx] = gaussians._scaling[idx]
+        gaussians._rotation_static[idx] = gaussians._rotation[idx]
+        gaussians._opacity_static[idx] = gaussians._opacity[idx]
+        gaussians._features_dc_static[idx] = gaussians._features_dc[idx]
+        gaussians._features_rest_static[idx] = gaussians._features_rest[idx]
+
+        gaussians._is_static_g[new_idx] = False
+        gaussians._xyz_static[new_idx] = gaussians._xyz[new_idx]
+        gaussians._scaling_static[new_idx] = gaussians._scaling[new_idx]
+        gaussians._rotation_static[new_idx] = gaussians._rotation[new_idx]
+        gaussians._opacity_static[new_idx] = gaussians._opacity[new_idx]
+        gaussians._features_dc_static[new_idx] = gaussians._features_dc[new_idx]
+        gaussians._features_rest_static[new_idx] = gaussians._features_rest[new_idx]
 
         gaussians.assert_metadata_alignment()
 
